@@ -1227,8 +1227,12 @@ describe("experimental Codex Anthropic gateway", () => {
   it("fails closed on mid-conversation system messages instead of demoting to user", () => {
     expect(() => toCodexRequests({
       ...baseRequest,
-      messages: [{ role: "system" as any, content: "mid-conversation system" }],
-    }, { cwd: "/workspace", model: "gpt-5.5" })).toThrow("Unsupported Anthropic message role at index 0");
+      messages: [
+        { role: "user", content: "hello" },
+        { role: "assistant", content: "hi" },
+        { role: "system" as any, content: "mid-conversation system" }
+      ],
+    }, { cwd: "/workspace", model: "gpt-5.5" })).toThrow("Unsupported Anthropic message role at index 2: mid-conversation system message");
   });
 
   it("keeps user messages as user authority", () => {

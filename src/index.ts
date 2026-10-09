@@ -235,7 +235,15 @@ export function toCodexRequests(
   const existingThreadId = options.threadId ?? stringMetadata(request, "codex_thread_id");
   const toolOutput = toolOutputFromMessages(request.messages, toolAliasesByOriginal);
   const input = toolOutput ? [] : flattenMessages(request);
-  const system = flattenSystem(request.system);
+  let system = flattenSystem(request.system);
+  for (const message of request.messages) {
+    if (message.role === "system") {
+      const text = typeof message.content === "string" ? message.content : flattenContent(message.content);
+      if (text) {
+        system = system ? `${system}\n${text}` : text;
+      }
+    }
+  }
   const additionalContext = system
     ? {
         "anthropic-system": {
@@ -1102,8 +1110,14 @@ function validateAnthropicRequest(request: AnthropicMessagesRequest): void {
   if (!Array.isArray(request.messages) || request.messages.length === 0) {
     throw new Error("Anthropic request must include at least one message");
   }
+  let foundAssistantRole = false;
   for (const [index, message] of request.messages.entries()) {
-    if (message.role !== "user" && message.role !== "assistant") {
+    if (message.role === "assistant") foundAssistantRole = true;
+    if (message.role === "system") {
+      if (foundAssistantRole) {
+        throw new Error(`Unsupported Anthropic message role at index ${index}: mid-conversation system message`);
+      }
+    } else if (message.role !== "user" && message.role !== "assistant") {
       throw new Error(`Unsupported Anthropic message role at index ${index}`);
     }
   }
@@ -1112,6 +1126,7 @@ function validateAnthropicRequest(request: AnthropicMessagesRequest): void {
 function flattenMessages(request: AnthropicMessagesRequest): Record<string, unknown>[] {
   const lines: string[] = [];
   for (const message of request.messages) {
+    if (message.role === "system") continue;
     const text = forwardableMessageText(message);
     if (text) {
       lines.push(`${message.role}: ${text}`);
