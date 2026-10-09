@@ -1224,15 +1224,17 @@ describe("experimental Codex Anthropic gateway", () => {
       toCodexRequests({ ...baseRequest, messages: [] }, { cwd: "/workspace" }),
     ).toThrow("Anthropic request must include at least one message");
   });
-  it("fails closed on mid-conversation system messages instead of demoting to user", () => {
-    expect(() => toCodexRequests({
+  it("allows mid-conversation system messages folded into additionalContext", () => {
+    const res = toCodexRequests({
       ...baseRequest,
       messages: [
         { role: "user", content: "hello" },
         { role: "assistant", content: "hi" },
         { role: "system" as any, content: "mid-conversation system" }
       ],
-    }, { cwd: "/workspace", model: "gpt-5.5" })).toThrow("Unsupported Anthropic message role at index 2: mid-conversation system message");
+    }, { cwd: "/workspace", model: "gpt-5.5" });
+    const additionalContext = res.requests[0].params.additionalContext as Record<string, { kind: string; value: string }>;
+    expect(additionalContext["anthropic-system"].value).toContain("mid-conversation system");
   });
 
   it("keeps user messages as user authority", () => {
