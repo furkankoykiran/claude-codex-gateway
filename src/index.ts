@@ -1114,9 +1114,7 @@ function validateAnthropicRequest(request: AnthropicMessagesRequest): void {
   for (const [index, message] of request.messages.entries()) {
     if (message.role === "assistant") foundAssistantRole = true;
     if (message.role === "system") {
-      if (foundAssistantRole) {
-        throw new Error(`Unsupported Anthropic message role at index ${index}: mid-conversation system message`);
-      }
+      // Allow mid-conversation system messages
     } else if (message.role !== "user" && message.role !== "assistant") {
       throw new Error(`Unsupported Anthropic message role at index ${index}`);
     }
