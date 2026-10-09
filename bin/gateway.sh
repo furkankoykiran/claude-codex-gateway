@@ -18,7 +18,7 @@ case "$1" in
       fi
     fi
     echo "Starting gateway..."
-    nohup env CODEX_GATEWAY_MODEL=gpt-6.1-sol bun "$SRC_FILE" serve > "$LOG_FILE" 2>&1 &
+    nohup bun "$SRC_FILE" serve > "$LOG_FILE" 2>&1 &
     echo $! > "$PID_FILE"
     echo "Gateway started (pid $(cat "$PID_FILE"))."
     ;;

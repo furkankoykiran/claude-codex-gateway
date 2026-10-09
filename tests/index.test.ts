@@ -1224,4 +1224,37 @@ describe("experimental Codex Anthropic gateway", () => {
       toCodexRequests({ ...baseRequest, messages: [] }, { cwd: "/workspace" }),
     ).toThrow("Anthropic request must include at least one message");
   });
+  it("fails closed on mid-conversation system messages instead of demoting to user", () => {
+    expect(() => toCodexRequests({
+      ...baseRequest,
+      messages: [{ role: "system" as any, content: "mid-conversation system" }],
+    }, { cwd: "/workspace", model: "gpt-5.5" })).toThrow("Unsupported Anthropic message role at index 0");
+  });
+
+  it("keeps user messages as user authority", () => {
+    expect(() => toCodexRequests({
+      ...baseRequest,
+      messages: [{ role: "user", content: "hello" }],
+    }, { cwd: "/workspace", model: "gpt-5.5" })).not.toThrow();
+  });
+
+  it("maps top-level system instructions to additionalContext", () => {
+    const batch = toCodexRequests({
+      ...baseRequest,
+      system: "top-level system",
+      messages: [{ role: "user", content: "hello" }],
+    }, { cwd: "/workspace", model: "gpt-5.5" });
+    expect(batch.requests[0]?.params["additionalContext"]).toEqual({
+      "anthropic-system": {
+        kind: "application",
+        value: "top-level system",
+      },
+    });
+  });
+
+  it("prevents default request-body logging from serve()", async () => {
+    const source = await Bun.file(import.meta.dir + "/../src/index.ts").text();
+    expect(source).not.toContain('appendFileSync("gateway.log"');
+    expect(source).not.toContain("REQ:");
+  });
 });
