@@ -1,0 +1,18 @@
+{
+  "name": "claude-codex-gateway",
+  "module": "src/index.ts",
+  "type": "module",
+  "private": true,
+  "devDependencies": {
+    "@types/bun": "latest"
+  },
+  "peerDependencies": {
+    "typescript": "^5"
+  },
+  "scripts": {
+    "start": "bin/gateway.sh start",
+    "stop": "bin/gateway.sh stop",
+    "status": "bin/gateway.sh status",
+    "test": "bun test"
+  }
+}
