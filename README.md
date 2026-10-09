@@ -22,8 +22,9 @@ An experimental, standalone gateway that allows native Claude Code to use a loca
 You must have [Bun](https://bun.sh/) and the official `codex` CLI installed.
 
 ```bash
-# Global install via npm
-npm install -g claude-codex-gateway
+# NPM is not yet published.
+# Install from the verified GitHub Release artifact:
+npm install -g https://github.com/furkankoykiran/claude-codex-gateway/releases/download/v0.1.1/claude-codex-gateway-0.1.1.tgz
 ```
 
 ## Setup & Configuration
@@ -57,6 +58,6 @@ npm install -g claude-codex-gateway
 
 ## Updates & Rollbacks
 
-- **Update**: `npm install -g claude-codex-gateway@latest`
-- **Rollback**: To rollback to a specific version, explicitly specify it: `npm install -g claude-codex-gateway@0.1.0`
-- **Uninstall**: `claude-codex-gateway stop && npm uninstall -g claude-codex-gateway`
+- **Update**: `npm install -g https://github.com/furkankoykiran/claude-codex-gateway/releases/download/v0.1.1/claude-codex-gateway-0.1.1.tgz`
+- **Rollback**: To rollback to a specific version, explicitly specify it: `npm install -g https://github.com/furkankoykiran/claude-codex-gateway/releases/download/v0.1.0/claude-codex-gateway-0.1.0.tgz`
+- **Uninstall**: `claude-codex-gateway stop; npm uninstall -g claude-codex-gateway`
