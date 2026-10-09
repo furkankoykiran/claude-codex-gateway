@@ -7,7 +7,7 @@
  * process-scoped network test blocks and observes Anthropic destinations.
  */
 
-export type AnthropicRole = "user" | "assistant";
+export type AnthropicRole = "user" | "assistant" | "system";
 
 export type AnthropicTextBlock = {
   type: "text";
