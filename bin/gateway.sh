@@ -10,7 +10,7 @@ done
 DIR="$( cd -P "$( dirname "$SOURCE" )" && pwd )"
 ROOT_DIR="$(dirname "$DIR")"
 SRC_FILE="$ROOT_DIR/src/index.ts"
-VERSION="0.1.0"
+VERSION="0.1.2"
 
 STATE_DIR="$HOME/.claude-codex-gateway"
 mkdir -p "$STATE_DIR"

@@ -24,7 +24,7 @@ You must have [Bun](https://bun.sh/) and the official `codex` CLI installed.
 ```bash
 # NPM is not yet published.
 # Install from the verified GitHub Release artifact:
-npm install -g https://github.com/furkankoykiran/claude-codex-gateway/releases/download/v0.1.1/claude-codex-gateway-0.1.1.tgz
+npm install -g https://github.com/furkankoykiran/claude-codex-gateway/releases/download/v0.1.2/claude-codex-gateway-0.1.2.tgz
 ```
 
 ## Setup & Configuration
@@ -58,6 +58,6 @@ npm install -g https://github.com/furkankoykiran/claude-codex-gateway/releases/d
 
 ## Updates & Rollbacks
 
-- **Update**: `npm install -g https://github.com/furkankoykiran/claude-codex-gateway/releases/download/v0.1.1/claude-codex-gateway-0.1.1.tgz`
+- **Update**: `npm install -g https://github.com/furkankoykiran/claude-codex-gateway/releases/download/v0.1.2/claude-codex-gateway-0.1.2.tgz`
 - **Rollback**: To rollback to a specific version, explicitly specify it: `npm install -g https://github.com/furkankoykiran/claude-codex-gateway/releases/download/v0.1.0/claude-codex-gateway-0.1.0.tgz`
 - **Uninstall**: `claude-codex-gateway stop; npm uninstall -g claude-codex-gateway`
