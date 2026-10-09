@@ -7,7 +7,7 @@
  * process-scoped network test blocks and observes Anthropic destinations.
  */
 
-export type AnthropicRole = "user" | "assistant";
+export type AnthropicRole = "user" | "assistant" | "system";
 
 export type AnthropicTextBlock = {
   type: "text";
@@ -1103,8 +1103,8 @@ function validateAnthropicRequest(request: AnthropicMessagesRequest): void {
     throw new Error("Anthropic request must include at least one message");
   }
   for (const [index, message] of request.messages.entries()) {
-    if (message.role !== "user" && message.role !== "assistant") {
-      throw new Error(`Unsupported Anthropic message role at index ${index}`);
+    if (message.role !== "user" && message.role !== "assistant" && message.role !== "system") {
+      throw new Error(`Unsupported Anthropic message role ${message.role} at index ${index}`);
     }
   }
 }
@@ -1780,6 +1780,7 @@ async function serve(): Promise<void> {
         return new Response("not found", { status: 404 });
       }
       let body: AnthropicMessagesRequest;
+      try { const txt = await req.clone().text(); require("fs").appendFileSync("gateway.log", "REQ: " + txt + "\n"); } catch (e) {}
       try {
         body = (await req.json()) as AnthropicMessagesRequest;
       } catch {
