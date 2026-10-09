@@ -1,18 +1,28 @@
 {
   "name": "claude-codex-gateway",
+  "version": "0.1.0",
+  "description": "Standalone Codex gateway for Claude Code",
+  "main": "src/index.ts",
   "module": "src/index.ts",
   "type": "module",
-  "private": true,
+  "bin": {
+    "claude-codex-gateway": "bin/gateway.sh"
+  },
+  "files": [
+    "src",
+    "bin"
+  ],
+  "scripts": {
+    "start": "bin/gateway.sh start",
+    "stop": "bin/gateway.sh stop",
+    "status": "bin/gateway.sh status",
+    "test": "bun test"
+  },
   "devDependencies": {
     "@types/bun": "latest"
   },
   "peerDependencies": {
     "typescript": "^5"
   },
-  "scripts": {
-    "start": "bin/gateway.sh start",
-    "stop": "bin/gateway.sh stop",
-    "status": "bin/gateway.sh status",
-    "test": "bun test"
-  }
+  "license": "MIT"
 }

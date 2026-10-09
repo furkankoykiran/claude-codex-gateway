@@ -1,34 +1,62 @@
-# Claude Codex Gateway
+# claude-codex-gateway
 
-A standalone gateway translating Claude Code's Anthropic API requests into Codex app-server protocol without behavioral changes.
+An experimental, standalone gateway that allows native Claude Code to use a local Anthropic-compatible Codex app-server for inference and tool execution.
 
-## Setup
+## Experimental Status
 
-```bash
-bun install
-```
+**⚠️ EXPERIMENTAL:** This is a narrow, fail-closed protocol subset meant for testing and local usage. It intentionally limits some features.
 
-## Running the Gateway
+## Architecture
 
-Start the gateway:
-```bash
-bun run start
-```
+- **Claude Code**: Native CLI execution, hooks, local tools, MCPs, and permission boundaries.
+- **Local Gateway** (`claude-codex-gateway`): Translates inference traffic.
+- **Official Codex App Server**: Local execution backend for code intelligence and reasoning.
 
-Stop the gateway:
-```bash
-bun run stop
-```
+## Tool Ownership & Permissions
 
-Check status:
-```bash
-bun run status
-```
+- **Execution**: Claude Code owns local tool execution (such as `Bash`, `Edit`, `Read`, `Write`), file permissions, and MCP functionality.
+- **Translation**: The gateway acts simply as a translation boundary mapping Claude Code inference requests into Codex thread turns.
 
-## Claude Code Configuration
+## Installation
 
-To use this gateway with Claude Code, set the `ANTHROPIC_BASE_URL` environment variable:
+You must have [Bun](https://bun.sh/) and the official `codex` CLI installed.
 
 ```bash
-export ANTHROPIC_BASE_URL=http://127.0.0.1:4545
+# Global install via npm
+npm install -g claude-codex-gateway
 ```
+
+## Setup & Configuration
+
+1. **Codex Authentication**:
+   The gateway uses the existing authenticated Codex CLI. Run `codex login` if needed.
+2. **Start the Gateway**:
+   ```bash
+   claude-codex-gateway start
+   ```
+3. **Check Gateway Health**:
+   ```bash
+   claude-codex-gateway doctor
+   ```
+4. **Configure Claude Code**:
+   Instruct Claude Code to use the local loopback gateway and a specific Codex model.
+   ```bash
+   export CODEX_GATEWAY_MODEL="gpt-6-astra"  # Choose a Codex model ID
+   export ANTHROPIC_BASE_URL="http://127.0.0.1:4545"
+   claude -p "Hello!"
+   ```
+   *Note: Model availability shown in `/v1/models` does not guarantee execution access; successful inference is your entitlement proof.*
+
+## Management CLI
+
+- `claude-codex-gateway start`: Start the gateway daemon.
+- `claude-codex-gateway status`: Check running status.
+- `claude-codex-gateway doctor`: Check system dependencies and configured model.
+- `claude-codex-gateway stop`: Stop the gateway daemon gracefully.
+- `claude-codex-gateway version`: Print version info.
+
+## Updates & Rollbacks
+
+- **Update**: `npm install -g claude-codex-gateway@latest`
+- **Rollback**: To rollback to a specific version, explicitly specify it: `npm install -g claude-codex-gateway@0.1.0`
+- **Uninstall**: `claude-codex-gateway stop && npm uninstall -g claude-codex-gateway`
