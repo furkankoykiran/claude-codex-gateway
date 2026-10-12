@@ -41,6 +41,8 @@ function createFakeCodexProcess(onRequest: (request: Record<string, unknown>, em
   });
   let input = "";
   const emit = (message: unknown) => {
+    const record = message as Record<string, any>;
+    if (record.method === "item/tool/call" && record.id === undefined) record.id = record.params.callId;
     stdoutController.enqueue(encoder.encode(`${JSON.stringify(message)}\n`));
   };
   return {
@@ -65,6 +67,195 @@ function createFakeCodexProcess(onRequest: (request: Record<string, unknown>, em
 }
 
 describe("experimental Codex Anthropic gateway", () => {
+  for (const terminal of ["turn/completed", "turn/failed", "turn/interrupted"]) {
+    it(`ignores late events from ${terminal} when the next request is pending`, async () => {
+      let nextThread = 0;
+      let previousThread = "";
+      const client = new CodexJsonRpcClient(createFakeCodexProcess((request, emit) => {
+        const id = request["id"];
+        const method = request["method"];
+        if (method === "initialize") emit({ id, result: {} });
+        if (method === "thread/start") emit({ id, result: { thread: { id: `thread-${++nextThread}` } } });
+        if (method !== "turn/start") return;
+        const params = request["params"] as Record<string, unknown>;
+        const threadId = String(params["threadId"]);
+        const turnId = `turn-${nextThread}`;
+        queueMicrotask(() => {
+          if (nextThread === 2) {
+            // Arrive before turn/started for the new request, after the old route was removed.
+            emit({ method: "item/agentMessage/delta", params: { threadId: previousThread, turnId: "turn-1", delta: "STALE_TURN_ONE" } });
+            emit({ method: "turn/completed", params: { threadId: previousThread, turn: { id: "turn-1" } } });
+          }
+          emit({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
+          emit({ method: "item/agentMessage/delta", params: { threadId, turnId, delta: nextThread === 1 ? "TURN_ONE_7F3A" : "TURN_TWO_9C21" } });
+          emit({ method: nextThread === 1 ? terminal : "turn/completed", params: { threadId, turn: { id: turnId }, message: "timed out" } });
+          previousThread = threadId;
+        });
+      }));
+      await client.turn({ ...baseRequest, model: "gpt-6.1-sol", messages: [{ role: "user", content: "TURN_ONE_7F3A" }] }, "/workspace");
+      const second = { ...baseRequest, model: "gpt-6.1-sol", messages: [{ role: "user" as const, content: "TURN_TWO_9C21" }] };
+      const events = await client.turn(second, "/workspace");
+      expect(nonStreamingAnthropicResponseFromEvents(second, events).content[0]?.text).toBe("TURN_TWO_9C21");
+    });
+  }
+
+  it("does not continue a completed tool result when an assistant reply follows it", () => {
+    const messages: AnthropicMessagesRequest["messages"] = [
+      { role: "user", content: "TURN_ONE_7F3A" },
+      { role: "assistant", content: [{ type: "tool_use", id: "old-tool", name: "Bash", input: { command: "pwd" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "old-tool", content: "/workspace" }] },
+      { role: "assistant", content: "TURN_ONE_7F3A" },
+    ];
+    expect(toolOutputFromMessages(messages)).toBeNull();
+    expect(promptlessInitialTurnError({ ...baseRequest, model: "gpt-6.1-sol", messages })).toContain("did not forward");
+  });
+
+  for (const failed of [false, true]) {
+    it(`keeps current text authoritative after a ${failed ? "timed out" : "completed"} tool cycle`, () => {
+      const canary = failed ? "AFTER_TIMEOUT_42DD" : "AFTER_TOOL_81BC";
+      const request: AnthropicMessagesRequest = {
+        ...baseRequest, model: "gpt-6.1-sol",
+        messages: [
+          { role: "user", content: "TURN_ONE_7F3A" },
+          { role: "assistant", content: [{ type: "tool_use", id: "old-tool", name: "Bash", input: { command: "pwd" } }] },
+          { role: "user", content: [{ type: "tool_result", tool_use_id: "old-tool", content: failed ? "tool timeout" : "/workspace", is_error: failed }] },
+          { role: "assistant", content: "TURN_ONE_7F3A" },
+          { role: "user", content: [{ type: "text", text: `<system-reminder>TURN_ONE_7F3A</system-reminder>` }, { type: "text", text: canary }] },
+        ],
+      };
+      const rpc = toCodexRequests(request, { cwd: "/workspace" }).requests[0]!;
+      expect(rpc.params["toolOutput"]).toBeUndefined();
+      const input = rpc.params["input"] as { text: string }[];
+      expect(input.at(-1)?.text).toBe(`user: ${canary}`);
+      // History is context, never another actionable user instruction.
+      expect(input[0]?.text).not.toContain("user: TURN_ONE_7F3A");
+      expect(JSON.stringify(input)).not.toContain("system-reminder");
+    });
+  }
+
+  it("treats a merged old tool result plus new user text as a fresh request", () => {
+    const request: AnthropicMessagesRequest = {
+      ...baseRequest, model: "gpt-6.1-sol",
+      messages: [
+        { role: "user", content: "TURN_ONE_7F3A" },
+        { role: "assistant", content: [{ type: "tool_use", id: "old-tool", name: "Bash", input: {} }] },
+        { role: "user", content: [
+          { type: "tool_result", tool_use_id: "old-tool", content: "old result" },
+          { type: "text", text: "AFTER_TOOL_81BC" },
+        ] },
+      ],
+    };
+    expect(toolOutputFromMessages(request.messages)).toBeNull();
+    const rpc = toCodexRequests(request, { cwd: "/workspace" }).requests[0]!;
+    expect(rpc.params["toolOutput"]).toBeUndefined();
+    expect(rpc.params["input"]).toEqual([{ type: "text", text: "user: AFTER_TOOL_81BC", text_elements: [] }]);
+  });
+
+  it("abandons an unconsumed tool route when current text starts a new turn", async () => {
+    let nextThread = 0;
+    let turnStarts = 0;
+    const client = new CodexJsonRpcClient(createFakeCodexProcess((request, emit) => {
+      const id = request["id"];
+      if (request["method"] === "initialize") emit({ id, result: {} });
+      if (request["method"] === "thread/start") emit({ id, result: { thread: { id: `thread-${++nextThread}` } } });
+      if (request["method"] !== "turn/start") return;
+      turnStarts += 1;
+      const threadId = `thread-${nextThread}`;
+      const turnId = `turn-${nextThread}`;
+      queueMicrotask(() => {
+        if (nextThread === 2) {
+          emit({ method: "item/tool/call", params: { threadId: "thread-1", turnId: "turn-1", callId: "late-tool", tool: "Bash", arguments: { command: "pwd" } } });
+        }
+        emit({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
+        if (nextThread === 1) {
+          emit({ method: "item/tool/call", params: { threadId, turnId, callId: "abandoned", tool: "Bash", arguments: { command: "pwd" } } });
+        } else {
+          emit({ method: "item/agentMessage/delta", params: { threadId, turnId, delta: "AFTER_TOOL_81BC" } });
+          emit({ method: "turn/completed", params: { threadId, turn: { id: turnId } } });
+        }
+      });
+    }));
+    const first = { ...baseRequest, model: "gpt-6.1-sol", messages: [{ role: "user" as const, content: "Use Bash to run pwd." }], tools: [{ name: "Bash", input_schema: { type: "object" } }] };
+    await client.turn(first, "/workspace");
+    const resultMessages: AnthropicMessagesRequest["messages"] = [
+      ...first.messages,
+      { role: "assistant", content: [{ type: "tool_use", id: "abandoned", name: "Bash", input: { command: "pwd" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "abandoned", content: "/workspace" }] },
+    ];
+    const next: AnthropicMessagesRequest = { ...first, messages: [...resultMessages, { role: "user", content: "AFTER_TOOL_81BC" }] };
+    const events = await client.turn(next, "/workspace");
+    expect(nonStreamingAnthropicResponseFromEvents(next, events).content[0]?.text).toBe("AFTER_TOOL_81BC");
+    const replay = await client.turn({ ...first, messages: resultMessages }, "/workspace");
+    expect(replay.filter((event) => event.event === "error")).toHaveLength(1);
+    expect(turnStarts).toBe(2);
+  });
+
+  it("preserves a pending Claude tool across a separate Auto classifier request in the same session", async () => {
+    let nextThread = 0;
+    const client = new CodexJsonRpcClient(createFakeCodexProcess((request, emit) => {
+      const id = request["id"];
+      if (!request["method"] && id === "auto-tool") {
+        queueMicrotask(() => {
+          emit({ method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-1", delta: "AUTO_DONE" } });
+          emit({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-1" } } });
+        });
+        return;
+      }
+      if (request["method"] === "initialize") emit({ id, result: {} });
+      if (request["method"] === "thread/start") emit({ id, result: { thread: { id: `thread-${++nextThread}` } } });
+      if (request["method"] !== "turn/start") return;
+      const params = request["params"] as Record<string, unknown>;
+      const threadId = String(params["threadId"]);
+      const turnId = params["toolOutput"] ? "turn-1" : `turn-${nextThread}`;
+      queueMicrotask(() => {
+        emit({ method: "turn/started", params: { threadId, turn: { id: turnId } } });
+        if (nextThread === 1 && !params["toolOutput"]) {
+          emit({ method: "item/tool/call", params: { threadId, turnId, callId: "auto-tool", tool: "Bash", arguments: { command: "pwd" } } });
+        } else {
+          emit({ method: "item/agentMessage/delta", params: { threadId, turnId, delta: params["toolOutput"] ? "AUTO_DONE" : "CLASSIFIER_VERDICT" } });
+          emit({ method: "turn/completed", params: { threadId, turn: { id: turnId } } });
+        }
+      });
+    }));
+    const first = { ...baseRequest, model: "gpt-6.1-sol", messages: [{ role: "user" as const, content: "Use Bash to run pwd." }], tools: [{ name: "Bash", input_schema: { type: "object" } }] };
+    await client.turn(first, "/workspace");
+    const classifier: AnthropicMessagesRequest = { ...first, tools: [], messages: [{ role: "user", content: "Review this pending action for safety." }] };
+    const verdict = await client.turn(classifier, "/workspace");
+    expect(nonStreamingAnthropicResponseFromEvents(classifier, verdict).content[0]?.text).toBe("CLASSIFIER_VERDICT");
+    const result: AnthropicMessagesRequest = { ...first, messages: [
+      ...first.messages,
+      { role: "assistant", content: [{ type: "tool_use", id: "auto-tool", name: "Bash", input: { command: "pwd" } }] },
+      { role: "user", content: [{ type: "tool_result", tool_use_id: "auto-tool", content: "/workspace" }] },
+    ] };
+    const events = await client.turn(result, "/workspace");
+    expect(nonStreamingAnthropicResponseFromEvents(result, events).content[0]?.text).toBe("AUTO_DONE");
+    expect(nextThread).toBe(2);
+  });
+
+  it("ignores stale thread metadata on a fresh user request", () => {
+    const batch = toCodexRequests({ ...baseRequest, metadata: { codex_thread_id: "completed-thread" } }, { cwd: "/workspace", model: "gpt-6.1-sol" });
+    expect(batch.threadId).toBeNull();
+    expect(batch.requests[0]?.params["threadId"]).not.toBe("completed-thread");
+  });
+
+  it("rejects tool results without a pending route before initializing Codex", async () => {
+    const methods: unknown[] = [];
+    const client = new CodexJsonRpcClient(createFakeCodexProcess((request, emit) => {
+      methods.push(request["method"]);
+      if (request["id"]) emit({ id: request["id"], error: { message: "Unexpected RPC" } });
+    }));
+    const request: AnthropicMessagesRequest = {
+      ...baseRequest, model: "gpt-6.1-sol",
+      messages: [
+        { role: "assistant", content: [{ type: "tool_use", id: "stale", name: "Bash", input: {} }] },
+        { role: "user", content: [{ type: "tool_result", tool_use_id: "stale", content: "old result" }] },
+      ],
+    };
+    const events = await client.turn(request, "/workspace");
+    expect(events.filter((event) => event.event === "error")).toHaveLength(1);
+    expect(methods).toEqual([]);
+  });
+
   it("declares the official app-server stdio boundary with an empty environment", () => {
     expect(codexAppServerCommand()).toEqual({
       command: "codex",
@@ -93,7 +284,7 @@ describe("experimental Codex Anthropic gateway", () => {
         sandboxPolicy: { type: "readOnly", networkAccess: false },
       },
     });
-    expect(String(batch.requests[0]?.params["threadId"])).toMatch(/^urn:uuid:[0-9a-f-]+$/);
+    expect(batch.requests[0]?.params["threadId"]).toBeUndefined();
     expect(batch.requests[0]?.params["additionalContext"]).toEqual({
       "anthropic-system": {
         kind: "application",
@@ -107,7 +298,7 @@ describe("experimental Codex Anthropic gateway", () => {
       cwd: "/workspace",
       model: "gpt-5.5",
       ephemeral: true,
-      threadSource: "fk-toolkit-codex-gateway",
+      threadSource: "claude-codex-gateway",
       approvalPolicy: "never",
       approvalsReviewer: "user",
       sandbox: "read-only",
@@ -138,18 +329,11 @@ describe("experimental Codex Anthropic gateway", () => {
           type: "function",
           name: "Bash",
           description:
-            'Run a shell command\n\nCall this Claude Code client tool with JSON arguments matching this schema: {"type":"object","properties":{"command":{"type":"string","description":"Shell command for Claude Code to run."},"description":{"type":"string","description":"Short description of what the command does."}},"required":["command"],"additionalProperties":false}',
+            'Run a shell command\n\nCall this Claude Code client tool with JSON arguments matching this schema: {"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}',
           inputSchema: {
             type: "object",
             properties: {
-              command: {
-                type: "string",
-                description: "Shell command for Claude Code to run.",
-              },
-              description: {
-                type: "string",
-                description: "Short description of what the command does.",
-              },
+              command: { type: "string" },
             },
             required: ["command"],
             additionalProperties: false,
@@ -174,7 +358,7 @@ describe("experimental Codex Anthropic gateway", () => {
     expect(requiredArguments.get("Bash")).toEqual(["command"]);
   });
 
-  it("prefers turn-mentioned tools before falling back to the supported core", () => {
+  it("prefers turn-mentioned tools before falling back to runtime-declared tools", () => {
     const tools = [
       { name: "Bash", input_schema: { type: "object" } },
       { name: "CronCreate", input_schema: { type: "object" } },
@@ -186,6 +370,7 @@ describe("experimental Codex Anthropic gateway", () => {
     ]);
     expect(codexDynamicToolsForTurn(tools, [{ role: "user", content: "Check my GitHub profile." }]).map((tool) => tool.name)).toEqual([
       "Bash",
+      "CronCreate",
       "mcp__github__get_me",
     ]);
   });
@@ -199,8 +384,8 @@ describe("experimental Codex Anthropic gateway", () => {
 
     expect(codexDynamicToolsForTurn(tools, [
       { role: "assistant", content: "Available tools include Agent and Write." },
-      { role: "user", content: "Call Bash with a harmless command." },
       { role: "user", content: "<system-reminder>\n# Environment\nAvailable tools include Agent and Write.\n</system-reminder>" },
+      { role: "user", content: "Call Bash with a harmless command." },
     ]).map((tool) => tool.name)).toEqual(["Bash"]);
   });
 
@@ -223,7 +408,7 @@ describe("experimental Codex Anthropic gateway", () => {
           },
         ],
       },
-    ]).map((tool) => tool.name)).toEqual(["Bash"]);
+    ], "Call Bash with exact JSON input.").map((tool) => tool.name)).toEqual(["Bash"]);
   });
 
   it("uses explicit turn text when Claude SDK moves the action prompt out of messages", () => {
@@ -311,7 +496,7 @@ describe("experimental Codex Anthropic gateway", () => {
     const requiredArguments = new Map<string, string[]>();
     const specs = codexDynamicToolSpecs(
       [
-        { name: "Bash", input_schema: { type: "object" } },
+        { name: "Bash", input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } },
         { name: "mcp__github__get_me", input_schema: { type: "object" } },
       ],
       [{ role: "user", content: "Use Bash." }],
@@ -340,30 +525,15 @@ describe("experimental Codex Anthropic gateway", () => {
     });
   });
 
-  it("uses compact Claude Code schemas for built-in client tools", () => {
-    expect(codexDynamicToolInputSchema("Bash", { type: "object", properties: { ignored: { type: "string" } } })).toEqual({
-      type: "object",
-      properties: {
-        command: {
-          type: "string",
-          description: "Shell command for Claude Code to run.",
-        },
-        description: {
-          type: "string",
-          description: "Short description of what the command does.",
-        },
-      },
-      required: ["command"],
-      additionalProperties: false,
-    });
-    expect(codexDynamicToolInputSchema("Write", null)).toMatchObject({
-      type: "object",
-      required: ["file_path", "content"],
-      additionalProperties: false,
-    });
+  it("preserves runtime schemas even when a tool shares a built-in name", () => {
+    const schema = { type: "object", properties: { nested: { type: "array", items: { type: "boolean" } }, timeout: { type: "number" } }, required: ["nested"], additionalProperties: true };
+    for (const name of ["Bash", "Write", "Read", "Edit", "custom"]) {
+      expect(codexDynamicToolInputSchema(name, schema)).toEqual(schema);
+    }
+    expect(schema).not.toHaveProperty("command");
   });
 
-  it("uses turn/start for multi-turn requests carrying a Codex thread id", () => {
+  it("uses only the gateway-provided thread route for a current turn", () => {
     const batch = toCodexRequests(
       {
         ...baseRequest,
@@ -374,7 +544,7 @@ describe("experimental Codex Anthropic gateway", () => {
           { role: "user", content: "Third" },
         ],
       },
-      { cwd: "/workspace", requestId: 7, model: "gpt-5.5" },
+      { cwd: "/workspace", requestId: 7, model: "gpt-5.5", threadId: "thread-123" },
     );
 
     expect(batch.requests[0]).toMatchObject({
@@ -385,7 +555,7 @@ describe("experimental Codex Anthropic gateway", () => {
         input: [
           {
             type: "text",
-            text: "user: First\n\nassistant: Second\n\nuser: Third",
+            text: "user: Third",
             text_elements: [],
           },
         ],
@@ -431,7 +601,7 @@ describe("experimental Codex Anthropic gateway", () => {
     expect(batch.requests[0]?.params["input"]).toEqual([
       {
         type: "text",
-        text: 'user: Use lookup.\n{"type":"tool_result","tool_use_id":"toolu_1","is_error":false,"content":"result text"}',
+        text: "user: Use lookup.",
         text_elements: [],
       },
     ]);
@@ -579,25 +749,20 @@ describe("experimental Codex Anthropic gateway", () => {
         emit({ jsonrpc: "2.0", id, result: { thread: { id: `thread-${nextThread}` } } });
         return;
       }
+      if (!method && id === "call_1") {
+        expect(request["result"]).toEqual({ success: true, contentItems: [{ type: "inputText", text: "/root/.claude" }] });
+        queueMicrotask(() => {
+          emit({ method: "item/agentMessage/delta", params: { threadId: "thread-1", turnId: "turn-a", delta: "PWD_DONE" } });
+          emit({ method: "turn/completed", params: { threadId: "thread-1", turn: { id: "turn-a" } } });
+        });
+        return;
+      }
       if (method !== "turn/start") {
         throw new Error(`unexpected method ${String(method)}`);
       }
       const params = request["params"] as Record<string, unknown>;
       turnStarts.push(params);
       const threadId = String(params["threadId"]);
-      if (params["toolOutput"]) {
-        expect(threadId).toBe("thread-1");
-        expect(params["toolOutput"]).toMatchObject({
-          toolUseId: "call_1",
-          name: "Bash",
-          output: "/root/.claude",
-        });
-        queueMicrotask(() => {
-          emit({ method: "item/agentMessage/delta", params: { threadId, turnId: "turn-a", delta: "PWD_DONE" } });
-          emit({ method: "turn/completed", params: { threadId, turn: { id: "turn-a" } } });
-        });
-        return;
-      }
       const text = JSON.stringify(params["input"]);
       if (text.includes("SECOND_TURN_OK")) {
         expect(threadId).toBe("thread-2");
@@ -657,6 +822,12 @@ describe("experimental Codex Anthropic gateway", () => {
       ],
       tools: turnA.tools,
     };
+    const foreignEvents = await client.turn(continuation, "/root/.claude", {
+      sessionId: "another-session", promptId: "prompt-a", requestClass: "tool_result", prevToolDurations: null,
+    });
+    expect(foreignEvents.filter((event) => event.event === "error")).toHaveLength(1);
+    expect(turnStarts).toHaveLength(1);
+
     const continuationEvents = await client.turn(continuation, "/root/.claude", {
       sessionId: "session-1",
       promptId: "prompt-a",
@@ -664,6 +835,12 @@ describe("experimental Codex Anthropic gateway", () => {
       prevToolDurations: "Bash=10",
     });
     expect(nonStreamingAnthropicResponseFromEvents(continuation, continuationEvents).content[0]?.text).toBe("PWD_DONE");
+
+    const replayEvents = await client.turn(continuation, "/root/.claude", {
+      sessionId: "session-1", promptId: "prompt-a", requestClass: "tool_result", prevToolDurations: null,
+    });
+    expect(replayEvents.filter((event) => event.event === "error")).toHaveLength(1);
+    expect(turnStarts).toHaveLength(1);
 
     const turnB = {
       ...baseRequest,
@@ -681,12 +858,12 @@ describe("experimental Codex Anthropic gateway", () => {
     });
     expect(nonStreamingAnthropicResponseFromEvents(turnB, turnBEvents).content[0]?.text).toBe("SECOND_TURN_OK");
 
-    expect(turnStarts).toHaveLength(3);
-    expect(turnStarts[1]?.["threadId"]).toBe("thread-1");
-    expect(turnStarts[2]?.["threadId"]).toBe("thread-2");
-    expect(JSON.stringify(turnStarts[2]?.["input"])).toContain("SECOND_TURN_OK");
-    expect(JSON.stringify(turnStarts[2]?.["input"])).not.toContain("PWD_DONE");
-    expect(turnStarts[2]?.["toolOutput"]).toBeUndefined();
+    expect(turnStarts).toHaveLength(2);
+    expect(turnStarts[0]?.["threadId"]).toBe("thread-1");
+    expect(turnStarts[1]?.["threadId"]).toBe("thread-2");
+    expect(JSON.stringify(turnStarts[1]?.["input"])).toContain("SECOND_TURN_OK");
+    expect(JSON.stringify(turnStarts[1]?.["input"])).not.toContain("PWD_DONE");
+    expect(turnStarts[1]?.["toolOutput"]).toBeUndefined();
   });
 
 
@@ -1007,6 +1184,7 @@ describe("experimental Codex Anthropic gateway", () => {
 
   it("fails closed when a completed dynamic tool item omits required arguments", () => {
     const state = createGatewayState();
+    state.toolRequiredArguments.set("Bash", ["command"]);
     const events = toAnthropicStreamEvents([
       {
         method: "turn/started",
@@ -1042,6 +1220,7 @@ describe("experimental Codex Anthropic gateway", () => {
 
   it("repairs empty tool input only from explicit JSON in the user prompt", () => {
     const state = createGatewayState();
+    state.toolRequiredArguments.set("Bash", ["command"]);
     state.turnText = 'Call the Bash tool with this exact JSON input: {"command":"printf ok","description":"print"}';
     const events = toAnthropicStreamEvents([
       {
@@ -1199,17 +1378,15 @@ describe("experimental Codex Anthropic gateway", () => {
       cleanShutdownRequests([
         ["turn-1", { threadId: "thread-1" }],
         ["turn-2", { threadId: "thread-2" }],
-      ]),
+      ]).map(({ id, ...request }) => request),
     ).toEqual([
       {
         jsonrpc: "2.0",
-        id: "shutdown-1",
         method: "turn/interrupt",
         params: { threadId: "thread-1", turnId: "turn-1" },
       },
       {
         jsonrpc: "2.0",
-        id: "shutdown-2",
         method: "turn/interrupt",
         params: { threadId: "thread-2", turnId: "turn-2" },
       },
@@ -1230,11 +1407,12 @@ describe("experimental Codex Anthropic gateway", () => {
       messages: [
         { role: "user", content: "hello" },
         { role: "assistant", content: "hi" },
-        { role: "system" as any, content: "mid-conversation system" }
+        { role: "user", content: "AFTER_SYSTEM_73AB" },
+        { role: "system", content: "mid-conversation system" }
       ],
     }, { cwd: "/workspace", model: "gpt-5.5" });
-    const additionalContext = res.requests[0].params.additionalContext as Record<string, { kind: string; value: string }>;
-    expect(additionalContext["anthropic-system"].value).toContain("mid-conversation system");
+    const additionalContext = res.requests[0]!.params.additionalContext as Record<string, { kind: string; value: string }>;
+    expect(additionalContext["anthropic-system"]!.value).toContain("mid-conversation system");
   });
 
   it("keeps user messages as user authority", () => {
@@ -1259,7 +1437,7 @@ describe("experimental Codex Anthropic gateway", () => {
   });
 
   it("prevents default request-body logging from serve()", async () => {
-    const source = await Bun.file(import.meta.dir + "/../src/index.ts").text();
+    const source = await Bun.file(import.meta.dir + "/../src/server.ts").text();
     expect(source).not.toContain('appendFileSync("gateway.log"');
     expect(source).not.toContain("REQ:");
   });

@@ -1,0 +1,40 @@
+{
+  "date": "2026-10-12",
+  "model": "gpt-6.1-sol",
+  "effort": "medium",
+  "sessionId": "49ab6c00-5eb0-4c3b-b69f-9a623618607d",
+  "completedReplies": [
+    "PENPOT_ALIVE",
+    "MCP_NEXT_TURN_91E4"
+  ],
+  "actualToolResultContains": "PENPOT_ALIVE",
+  "toolCode": "return \"PENPOT_ALIVE\";",
+  "origins": [
+    {
+      "toolUseId": "exec-d6f0bb69-2356-4ea5-8436-317e79fe7f1a",
+      "threadId": "01a1303d-bd33-7eb2-8780-45d8b9b682a4",
+      "turnId": "01a1303d-be89-7a32-837b-3bef89fe773e",
+      "rpcId": 0
+    },
+    {
+      "toolUseId": "exec-3a4e469f-202e-46a4-a93e-cd0781ba7aee",
+      "threadId": "01a1303d-bd33-7eb2-8780-45d8b9b682a4",
+      "turnId": "01a1303d-be89-7a32-837b-3bef89fe773e",
+      "rpcId": 1
+    }
+  ],
+  "next": {
+    "promptId": "55694e54-084b-4c69-ae08-4eaec47b455e",
+    "appServerThreadId": "01a1303e-0894-75e3-b9c4-559fb3dfdaa0",
+    "appServerTurnId": "01a1303e-0a9f-7931-8941-f0eb59341e8c",
+    "hasToolResult": false,
+    "terminalTurnState": "turn/completed"
+  },
+  "checks": {
+    "realClaudeOwnedMcpExecution": true,
+    "everyActualResultAnsweredItsOriginalRpcExactlyOnce": true,
+    "freshPromptFreshThreadFreshTurn": true,
+    "noToolOnNextTurn": true
+  },
+  "limitation": "The model requested two distinct calls in the first turn; each was executed and correlated once. This is not exactly-one-call model compliance or concurrency stress proof."
+}
