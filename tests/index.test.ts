@@ -298,7 +298,7 @@ describe("experimental Codex Anthropic gateway", () => {
       cwd: "/workspace",
       model: "gpt-5.5",
       ephemeral: true,
-      threadSource: "fk-toolkit-codex-gateway",
+      threadSource: "claude-codex-gateway",
       approvalPolicy: "never",
       approvalsReviewer: "user",
       sandbox: "read-only",
@@ -329,18 +329,11 @@ describe("experimental Codex Anthropic gateway", () => {
           type: "function",
           name: "Bash",
           description:
-            'Run a shell command\n\nCall this Claude Code client tool with JSON arguments matching this schema: {"type":"object","properties":{"command":{"type":"string","description":"Shell command for Claude Code to run."},"description":{"type":"string","description":"Short description of what the command does."}},"required":["command"],"additionalProperties":false}',
+            'Run a shell command\n\nCall this Claude Code client tool with JSON arguments matching this schema: {"type":"object","properties":{"command":{"type":"string"}},"required":["command"],"additionalProperties":false}',
           inputSchema: {
             type: "object",
             properties: {
-              command: {
-                type: "string",
-                description: "Shell command for Claude Code to run.",
-              },
-              description: {
-                type: "string",
-                description: "Short description of what the command does.",
-              },
+              command: { type: "string" },
             },
             required: ["command"],
             additionalProperties: false,
@@ -503,7 +496,7 @@ describe("experimental Codex Anthropic gateway", () => {
     const requiredArguments = new Map<string, string[]>();
     const specs = codexDynamicToolSpecs(
       [
-        { name: "Bash", input_schema: { type: "object" } },
+        { name: "Bash", input_schema: { type: "object", properties: { command: { type: "string" } }, required: ["command"] } },
         { name: "mcp__github__get_me", input_schema: { type: "object" } },
       ],
       [{ role: "user", content: "Use Bash." }],
@@ -532,27 +525,12 @@ describe("experimental Codex Anthropic gateway", () => {
     });
   });
 
-  it("uses compact Claude Code schemas for built-in client tools", () => {
-    expect(codexDynamicToolInputSchema("Bash", { type: "object", properties: { ignored: { type: "string" } } })).toEqual({
-      type: "object",
-      properties: {
-        command: {
-          type: "string",
-          description: "Shell command for Claude Code to run.",
-        },
-        description: {
-          type: "string",
-          description: "Short description of what the command does.",
-        },
-      },
-      required: ["command"],
-      additionalProperties: false,
-    });
-    expect(codexDynamicToolInputSchema("Write", null)).toMatchObject({
-      type: "object",
-      required: ["file_path", "content"],
-      additionalProperties: false,
-    });
+  it("preserves runtime schemas even when a tool shares a built-in name", () => {
+    const schema = { type: "object", properties: { nested: { type: "array", items: { type: "boolean" } }, timeout: { type: "number" } }, required: ["nested"], additionalProperties: true };
+    for (const name of ["Bash", "Write", "Read", "Edit", "custom"]) {
+      expect(codexDynamicToolInputSchema(name, schema)).toEqual(schema);
+    }
+    expect(schema).not.toHaveProperty("command");
   });
 
   it("uses only the gateway-provided thread route for a current turn", () => {
@@ -1206,6 +1184,7 @@ describe("experimental Codex Anthropic gateway", () => {
 
   it("fails closed when a completed dynamic tool item omits required arguments", () => {
     const state = createGatewayState();
+    state.toolRequiredArguments.set("Bash", ["command"]);
     const events = toAnthropicStreamEvents([
       {
         method: "turn/started",
@@ -1241,6 +1220,7 @@ describe("experimental Codex Anthropic gateway", () => {
 
   it("repairs empty tool input only from explicit JSON in the user prompt", () => {
     const state = createGatewayState();
+    state.toolRequiredArguments.set("Bash", ["command"]);
     state.turnText = 'Call the Bash tool with this exact JSON input: {"command":"printf ok","description":"print"}';
     const events = toAnthropicStreamEvents([
       {
@@ -1457,7 +1437,7 @@ describe("experimental Codex Anthropic gateway", () => {
   });
 
   it("prevents default request-body logging from serve()", async () => {
-    const source = await Bun.file(import.meta.dir + "/../src/index.ts").text();
+    const source = await Bun.file(import.meta.dir + "/../src/server.ts").text();
     expect(source).not.toContain('appendFileSync("gateway.log"');
     expect(source).not.toContain("REQ:");
   });
