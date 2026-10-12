@@ -116,11 +116,16 @@ export type GatewayState = {
   terminalTurnState: string | null;
   toolResultContinuation: boolean;
   emittedText: string;
+  model: string | null;
 };
 
 type PendingToolRoute = {
   threadId: string;
   turnId: string;
+  sessionId: string | null;
+  rpcId: string | number;
+  delivered: boolean;
+  notification: JsonRpcNotification;
 };
 
 type ClaudeGatewayRequestTrace = {
@@ -205,6 +210,7 @@ export function createGatewayState(): GatewayState {
     terminalTurnState: null,
     toolResultContinuation: false,
     emittedText: "",
+    model: null,
   };
 }
 
@@ -232,7 +238,7 @@ export function toCodexRequests(
     throw new Error(promptlessError);
   }
 
-  const existingThreadId = options.threadId ?? stringMetadata(request, "codex_thread_id");
+  const existingThreadId = options.threadId ?? null;
   const toolOutput = toolOutputFromMessages(request.messages, toolAliasesByOriginal);
   const input = toolOutput ? [] : flattenMessages(request);
   let system = flattenSystem(request.system);
@@ -269,10 +275,10 @@ export function toCodexRequests(
     params["effort"] = options.reasoningEffort;
   }
 
-  const requestId = options.requestId ?? "turn-1";
-  const threadId = existingThreadId ?? `urn:uuid:${crypto.randomUUID()}`;
+  const requestId = options.requestId ?? crypto.randomUUID();
+  const threadId = existingThreadId;
   const method = "turn/start";
-  const codexParams = { ...params, threadId };
+  const codexParams = { ...params, ...(threadId ? { threadId } : {}) };
 
   return {
     threadId: existingThreadId,
@@ -355,8 +361,7 @@ export function codexDynamicToolsForTurn(tools: AnthropicTool[], messages: Anthr
   if (mentioned.length > 0) {
     return mentioned;
   }
-  const supportedCore = new Set(["Bash", "Read", "Edit", "Write", "Task"]);
-  return tools.filter((tool) => supportedCore.has(tool.name) || tool.name.startsWith("mcp__"));
+  return tools;
 }
 
 export function codexDynamicToolName(name: string, index: number): string {
@@ -368,26 +373,15 @@ export function codexDynamicToolName(name: string, index: number): string {
 }
 
 function latestUserMessageText(messages: AnthropicMessage[]): string {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message?.role === "user") {
-      const text = forwardableMessageText(message);
-      if (text) {
-        return text;
-      }
-    }
-  }
-  return "";
+  const message = latestUserMessage(messages);
+  return message ? forwardableUserContentText(message.content) : "";
 }
 
 function latestUserMessage(messages: AnthropicMessage[]): AnthropicMessage | null {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message?.role === "user") {
-      return message;
-    }
-  }
-  return null;
+  // System context may follow a user request, but a completed assistant reply
+  // must never make an earlier user/tool-result message current again.
+  const message = messages.findLast((message) => message.role !== "system");
+  return message?.role === "user" ? message : null;
 }
 
 export function latestUserContentBlockTypes(messages: AnthropicMessage[]): string[] {
@@ -402,26 +396,11 @@ export function latestUserContentBlockTypes(messages: AnthropicMessage[]): strin
 }
 
 function latestUserMessageHasActionableText(messages: AnthropicMessage[]): boolean {
-  for (let index = messages.length - 1; index >= 0; index -= 1) {
-    const message = messages[index];
-    if (message?.role === "user") {
-      return forwardableUserContentText(message.content).trim().length > 0;
-    }
-  }
-  return false;
+  return latestUserMessageText(messages).trim().length > 0;
 }
 
 function turnTextForRequest(request: AnthropicMessagesRequest): string {
-  const userText = latestUserMessageText(request.messages);
-  if (userText) {
-    return userText;
-  }
-  const systemText = flattenSystem(request.system) ?? "";
-  return hasExplicitJsonToolInput(systemText) ? systemText : "";
-}
-
-function hasExplicitJsonToolInput(text: string): boolean {
-  return /\bexact JSON input\s*:\s*\{[^\n]+\}/i.test(text);
+  return latestUserMessageText(request.messages);
 }
 
 export function promptlessInitialTurnError(
@@ -658,11 +637,11 @@ export function toAnthropicStreamEvents(
       data: {
         type: "message_start",
         message: {
-          id: "msg_codex_gateway",
+          id: `msg_${crypto.randomUUID()}`,
           type: "message",
           role: "assistant",
           content: [],
-          model: "codex-app-server",
+          model: state.model,
           stop_reason: null,
           stop_sequence: null,
           usage: { input_tokens: 0, output_tokens: 0 },
@@ -878,6 +857,12 @@ export function toAnthropicStreamEvents(
       data: { type: "content_block_stop", index: contentIndex },
     });
   }
+  if (!events.some((event) => event.event === "message_delta")
+    && events.some((event) => event.event === "content_block_start"
+    && (event.data["content_block"] as { type?: string } | undefined)?.type === "tool_use")) {
+    events.push({ event: "message_delta", data: { type: "message_delta",
+      delta: { stop_reason: "tool_use", stop_sequence: null }, usage: { output_tokens: 0 } } });
+  }
   events.push({ event: "message_stop", data: { type: "message_stop" } });
   return events;
 }
@@ -899,7 +884,7 @@ export function nonStreamingAnthropicResponseFromEvents(
     })
     .join("");
   return {
-    id: "msg_codex_gateway",
+    id: String((events.find((event) => event.event === "message_start")?.data.message as { id?: string } | undefined)?.id ?? `msg_${crypto.randomUUID()}`),
     type: "message",
     role: "assistant",
     model: resolveCodexModel(request.model, selectedModel),
@@ -952,7 +937,10 @@ export function toolOutputFromMessages(
       }
     }
   }
-  const latestUser = [...messages].reverse().find((message) => message.role === "user");
+  const latestUser = latestUserMessage(messages);
+  // Claude Code can merge an old tool result with the next user instruction.
+  // Actionable current text always starts a fresh turn, even in that shape.
+  if (latestUser && forwardableUserContentText(latestUser.content).trim()) return null;
   if (!latestUser || !Array.isArray(latestUser.content)) {
     return null;
   }
@@ -979,7 +967,7 @@ export function toolOutputFromMessages(
 export function cancellationRequest(
   threadId: string,
   turnId: string,
-  id: string | number = "cancel-1",
+  id: string | number = crypto.randomUUID(),
 ): JsonRpcRequest {
   if (!threadId || !turnId) {
     throw new Error("Cancellation requires both threadId and turnId");
@@ -1010,8 +998,8 @@ export function shouldForwardWithRetryDedupe(
 export function cleanShutdownRequests(
   activeTurns: Iterable<[string, { threadId: string }]>,
 ): JsonRpcRequest[] {
-  return Array.from(activeTurns, ([turnId, turn], index) =>
-    cancellationRequest(turn.threadId, turnId, `shutdown-${index + 1}`),
+  return Array.from(activeTurns, ([turnId, turn]) =>
+    cancellationRequest(turn.threadId, turnId),
   );
 }
 
@@ -1110,9 +1098,7 @@ function validateAnthropicRequest(request: AnthropicMessagesRequest): void {
   if (!Array.isArray(request.messages) || request.messages.length === 0) {
     throw new Error("Anthropic request must include at least one message");
   }
-  let foundAssistantRole = false;
   for (const [index, message] of request.messages.entries()) {
-    if (message.role === "assistant") foundAssistantRole = true;
     if (message.role === "system") {
       // Allow mid-conversation system messages
     } else if (message.role !== "user" && message.role !== "assistant") {
@@ -1122,35 +1108,20 @@ function validateAnthropicRequest(request: AnthropicMessagesRequest): void {
 }
 
 function flattenMessages(request: AnthropicMessagesRequest): Record<string, unknown>[] {
-  const lines: string[] = [];
-  for (const message of request.messages) {
-    if (message.role === "system") continue;
-    const text = forwardableMessageText(message);
-    if (text) {
-      lines.push(`${message.role}: ${text}`);
-    }
+  const text = latestUserMessageText(request.messages);
+  if (!text) {
+    throw new Error("Anthropic request has no current user text to forward");
   }
-  if (lines.length === 0) {
-    throw new Error("Anthropic request has no text or tool-result content to forward");
-  }
-  return [{ type: "text", text: lines.join("\n\n"), text_elements: [] }];
-}
-
-function forwardableMessageText(message: AnthropicMessage): string {
-  return message.role === "user" ? forwardableUserContentText(message.content) : flattenContent(message.content);
+  return [{ type: "text", text: `user: ${text}`, text_elements: [] }];
 }
 
 function forwardableUserContentText(content: AnthropicMessage["content"]): string {
   if (typeof content === "string") {
     return isActionableUserText(content) ? content : "";
   }
-  const hasActionableText = content.some((block) => block.type === "text" && isActionableUserText(block.text));
-  if (!hasActionableText) {
-    return "";
-  }
   return content
-    .map((block) => block.type === "text" && !isActionableUserText(block.text) ? "" : flattenContent([block]))
-    .filter(Boolean)
+    .filter((block): block is AnthropicTextBlock => block.type === "text" && isActionableUserText(block.text))
+    .map((block) => block.text)
     .join("\n");
 }
 
@@ -1194,14 +1165,6 @@ function flattenSystem(system: AnthropicMessagesRequest["system"]): string | nul
     return system;
   }
   return system.map((block) => block.text).join("\n");
-}
-
-function stringMetadata(
-  request: AnthropicMessagesRequest,
-  key: string,
-): string | null {
-  const value = request.metadata?.[key];
-  return typeof value === "string" && value.length > 0 ? value : null;
 }
 
 function mergeNullableRecords(
@@ -1377,8 +1340,18 @@ type CodexProcess = {
 type PendingTurn = {
   resolve: (events: AnthropicSseEvent[]) => void;
   reject: (error: Error) => void;
+};
+
+type OriginTurn = {
+  threadId: string;
+  turnId: string | null;
+  sessionId: string | null;
   state: GatewayState;
   notifications: JsonRpcNotification[];
+  waiter?: PendingTurn;
+  dispatchScheduled: boolean;
+  requestId: string | number;
+  seenToolCalls: Map<string, string | number>;
 };
 
 const encoder = new TextEncoder();
@@ -1407,192 +1380,229 @@ export function failClosedClientRequestResult(method: string): Record<string, un
 }
 
 export class CodexJsonRpcClient {
-  private seq = 0;
-  private initialized = false;
+  private initialization?: Promise<void>;
+  private closedError?: Error;
   private readonly rpcPending = new Map<string | number, { resolve: (value: unknown) => void; reject: (error: Error) => void }>();
-  private readonly pending = new Map<string | number, PendingTurn>();
-  private readonly activeByTurn = new Map<string, { threadId: string; pending: PendingTurn }>();
+  private readonly starting = new Map<string | number, OriginTurn>();
+  private readonly origins = new Map<string, OriginTurn>();
+  private readonly activeByTurn = new Map<string, OriginTurn>();
   private readonly pendingToolRoutes = new Map<string, PendingToolRoute>();
-  private readonly toolAliasesByOriginal = new Map<string, string>();
 
   constructor(private readonly proc: CodexProcess) {
     this.readLoop().catch((error) => this.rejectAll(error));
     this.stderrLoop().catch(() => undefined);
   }
 
+  private turnKey(threadId: string, turnId: string): string {
+    return JSON.stringify([threadId, turnId]);
+  }
+
   async turn(
     request: AnthropicMessagesRequest,
     cwd: string,
-    headerHints: ClaudeGatewayHeaderHints = {
-      sessionId: null,
-      promptId: null,
-      requestClass: null,
-      prevToolDurations: null,
-    },
+    headerHints: ClaudeGatewayHeaderHints = { sessionId: null, promptId: null, requestClass: null, prevToolDurations: null },
+    signal?: AbortSignal,
   ): Promise<AnthropicSseEvent[]> {
+    validateAnthropicRequest(request);
     const state = createGatewayState();
     state.turnText = turnTextForRequest(request);
-    traceRequestContext(request);
-    const toolOutput = toolOutputFromMessages(request.messages, this.toolAliasesByOriginal);
-    state.toolResultContinuation = toolOutput !== null;
-    const promptlessError = promptlessInitialTurnError(request, this.toolAliasesByOriginal);
-    if (promptlessError) {
-      const events = toAnthropicStreamEvents([{ method: "error", params: { message: promptlessError } }], state);
-      traceClaudeGatewayRequest({
-        event: "codex-gateway.claudeRequest",
-        ...headerHints,
-        latestUserContentBlockTypes: latestUserContentBlockTypes(request.messages),
-        actionableUserText: state.turnText,
-        hasToolResult: toolOutput !== null,
-        appServerThreadId: state.appServerThreadId,
-        appServerTurnId: state.appServerTurnId,
-        terminalTurnState: state.terminalTurnState,
-      });
-      return events;
-    }
-
-    await this.initialize();
-    const id = `anthropic-${++this.seq}`;
-    const selectedModel = process.env.CODEX_GATEWAY_MODEL || process.env.CODEX_MODEL;
-    const toolRoute = toolOutput ? this.pendingToolRoutes.get(toolOutput.toolUseId) : undefined;
-    codexDynamicToolSpecs(
-      request.tools ?? [],
-      request.messages,
-      state.toolNameAliases,
-      this.toolAliasesByOriginal,
-      state.toolRequiredArguments,
-      state.turnText,
-    );
-    const batch = toCodexRequests(
-      request,
-      {
-        cwd,
-        requestId: id,
-        threadId: toolRoute?.threadId,
-        model: selectedModel,
-        reasoningEffort: process.env.CODEX_GATEWAY_REASONING_EFFORT,
-      },
-      this.toolAliasesByOriginal,
-    );
-    const rpc = batch.requests[0];
-    if (rpc && batch.threadId === null) {
-      const response = await this.request(
-        `thread-${this.seq}`,
-        "thread/start",
-        codexThreadStartParams(
-          cwd,
-          selectedModel,
-          request.model,
-          request.tools ?? [],
-          request.messages,
-          state.toolNameAliases,
-          this.toolAliasesByOriginal,
-          state.toolRequiredArguments,
-          state.turnText,
-        ),
-      );
-      const thread = (response as { thread?: { id?: string } }).thread;
-      if (!thread?.id) throw new Error("Codex thread/start returned no thread id");
-      rpc.params.threadId = thread.id;
-    }
-    if (!rpc || !shouldForwardWithRetryDedupe(state, rpc)) {
-      throw new Error("Codex gateway refused to forward duplicate request");
-    }
-    const events = await new Promise<AnthropicSseEvent[]>((resolve, reject) => {
-      const pending: PendingTurn = { resolve, reject, state, notifications: [] };
-      this.pending.set(id, pending);
-      if (toolOutput && toolRoute) {
-        this.activeByTurn.set(toolRoute.turnId, { threadId: toolRoute.threadId, pending });
-        this.pendingToolRoutes.delete(toolOutput.toolUseId);
+    const current = latestUserMessage(request.messages);
+    const results = !state.turnText.trim() && current && Array.isArray(current.content)
+      ? current.content.filter((block): block is AnthropicToolResultBlock => block.type === "tool_result")
+      : [];
+    const routes = results.map((result) => this.pendingToolRoutes.get(result.tool_use_id));
+    const route = routes[0];
+    let origin = route ? this.activeByTurn.get(this.turnKey(route.threadId, route.turnId)) : undefined;
+    let error = signal?.aborted ? "Claude Code request cancelled before inference." : null;
+    if (!error && results.length) {
+      if (!origin || new Set(results.map((result) => result.tool_use_id)).size !== results.length
+        || routes.some((candidate) => !candidate || !candidate.delivered || candidate.sessionId !== headerHints.sessionId
+          || candidate.threadId !== origin!.threadId || candidate.turnId !== origin!.turnId)) {
+        error = "Claude Code tool result has no matching pending tool use/turn in this session; refusing stale continuation.";
+      } else if (Array.from(this.pendingToolRoutes.entries()).some(([id, pending]) => pending.delivered
+        && pending.threadId === origin!.threadId && pending.turnId === origin!.turnId
+        && !results.some((result) => result.tool_use_id === id))) {
+        error = "Claude Code did not provide all delivered tool results for the pending turn.";
+      } else if (origin.waiter) {
+        error = "Claude Code tool continuation already has a pending response.";
       }
-      this.writeJson(rpc).catch((error) => {
-        this.pending.delete(id);
-        if (toolOutput && toolRoute) {
-          this.activeByTurn.delete(toolRoute.turnId);
-          this.pendingToolRoutes.set(toolOutput.toolUseId, toolRoute);
+    } else if (!error && !state.turnText.trim()) {
+      error = "Claude Code did not forward an actionable user prompt to the Codex gateway; refusing to run Codex on system reminders only.";
+    }
+    let events: AnthropicSseEvent[];
+    if (error) {
+      events = toAnthropicStreamEvents([{ method: "error", params: { message: error } }], state);
+    } else if (results.length && origin) {
+      // Dynamic tools resume by answering the outstanding server request.
+      // No new turn/start and no empty acknowledgement is sent here.
+      const continuing = origin;
+      events = await this.waitForResponse(continuing, signal, async () => {
+        for (const [index, result] of results.entries()) {
+          const pendingRoute = routes[index]!;
+          this.pendingToolRoutes.delete(result.tool_use_id);
+          const output = typeof result.content === "string" ? result.content : flattenContent(result.content);
+          await this.writeJson({ jsonrpc: "2.0", id: pendingRoute.rpcId,
+            result: { success: result.is_error !== true, contentItems: [{ type: "inputText", text: output }] } });
+          this.traceRoute("tool_result", continuing, { toolUseId: result.tool_use_id, rpcId: pendingRoute.rpcId, success: result.is_error !== true });
         }
-        reject(error instanceof Error ? error : new Error(String(error)));
+        this.dispatchTools(continuing);
       });
-    });
-    traceClaudeGatewayRequest({
-      event: "codex-gateway.claudeRequest",
-      ...headerHints,
+    } else {
+      // Structured prior tool items identify superseded cycles. Independent
+      // classifier requests have their own turn and must not consume them.
+      const superseded = new Set<OriginTurn>();
+      for (const message of request.messages) {
+        if (!Array.isArray(message.content)) continue;
+        for (const block of message.content) {
+          const id = block.type === "tool_result" ? block.tool_use_id : block.type === "tool_use" ? block.id : null;
+          const candidate = id ? this.pendingToolRoutes.get(id) : undefined;
+          if (candidate?.sessionId === headerHints.sessionId) {
+            const previous = this.activeByTurn.get(this.turnKey(candidate.threadId, candidate.turnId));
+            if (previous) superseded.add(previous);
+          }
+        }
+      }
+      for (const previous of superseded) await this.cancelOrigin(previous, "Superseded by current Claude Code user text.");
+      await this.initialize();
+      const selectedModel = process.env.CODEX_GATEWAY_MODEL || process.env.CODEX_MODEL;
+      state.model = resolveCodexModel(request.model, selectedModel);
+      const response = await this.request(crypto.randomUUID(), "thread/start", codexThreadStartParams(
+        cwd, selectedModel, request.model, request.tools ?? [], request.messages,
+        state.toolNameAliases, new Map(), state.toolRequiredArguments, state.turnText,
+      ));
+      const threadId = (response as { thread?: { id?: string } }).thread?.id;
+      if (!threadId) throw new Error("Codex thread/start returned no thread id");
+      if (signal?.aborted) throw new Error("Claude Code request cancelled before turn/start.");
+      const requestId = crypto.randomUUID();
+      origin = { threadId, turnId: null, sessionId: headerHints.sessionId, state, notifications: [], dispatchScheduled: false, requestId, seenToolCalls: new Map() };
+      this.origins.set(threadId, origin);
+      this.starting.set(requestId, origin);
+      const batch = toCodexRequests(request, { cwd, model: selectedModel, threadId, requestId,
+        reasoningEffort: process.env.CODEX_GATEWAY_REASONING_EFFORT });
+      events = await this.waitForResponse(origin, signal, () => this.writeJson(batch.requests[0]));
+    }
+    const finalState = origin?.state ?? state;
+    traceClaudeGatewayRequest({ event: "codex-gateway.claudeRequest", ...headerHints,
       latestUserContentBlockTypes: latestUserContentBlockTypes(request.messages),
-      actionableUserText: state.turnText,
-      hasToolResult: toolOutput !== null,
-      appServerThreadId: state.appServerThreadId,
-      appServerTurnId: state.appServerTurnId,
-      terminalTurnState: state.terminalTurnState,
-    });
+      actionableUserText: results.length ? "" : state.turnText, hasToolResult: results.length > 0,
+      appServerThreadId: finalState.appServerThreadId, appServerTurnId: finalState.appServerTurnId,
+      terminalTurnState: finalState.terminalTurnState });
     return events;
   }
 
-  async models(): Promise<CodexModelListResult> {
-    await this.initialize();
-    return (await this.request(`models-${++this.seq}`, "model/list", {})) as CodexModelListResult;
-  }
-
-  async account(): Promise<unknown> {
-    await this.initialize();
-    return await this.request(`account-${++this.seq}`, "account/read", { refreshToken: false });
-  }
-
-  async accountRateLimits(): Promise<unknown> {
-    await this.initialize();
-    return await this.request(`rate-limits-${++this.seq}`, "account/rateLimits/read", {
-      excludeResetCreditDetails: false,
-    });
-  }
-
-  async accountUsage(threadId?: string | null): Promise<unknown> {
-    await this.initialize();
-    return await this.request(`usage-${++this.seq}`, "account/usage/read", threadId ? { threadId } : {});
-  }
-
-  async interruptAll(): Promise<void> {
-    const active = Array.from(this.activeByTurn.entries()).map(([turnId, turn]) => [turnId, { threadId: turn.threadId }] as [string, { threadId: string }]);
-    for (const request of cleanShutdownRequests(active)) {
-      await this.writeJson(request);
+  private async waitForResponse(origin: OriginTurn, signal: AbortSignal | undefined, send: () => Promise<unknown>): Promise<AnthropicSseEvent[]> {
+    const abort = () => { void this.cancelOrigin(origin, "Claude Code request cancelled."); };
+    try {
+      return await new Promise<AnthropicSseEvent[]>((resolve, reject) => {
+        origin.waiter = { resolve, reject };
+        signal?.addEventListener("abort", abort, { once: true });
+        if (signal?.aborted) { abort(); return; }
+        send().catch((error) => { void this.cancelOrigin(origin, error instanceof Error ? error.message : String(error)); });
+      });
+    } finally {
+      signal?.removeEventListener("abort", abort);
     }
   }
 
+  private flush(origin: OriginTurn): void {
+    const waiter = origin.waiter;
+    if (!waiter) return;
+    origin.waiter = undefined;
+    try {
+      // Each HTTP response consumes only the events accumulated for it.
+      const events = toAnthropicStreamEvents(origin.notifications.splice(0), origin.state);
+      origin.state.emittedText = "";
+      waiter.resolve(events);
+    } catch (error) {
+      waiter.reject(error instanceof Error ? error : new Error(String(error)));
+    }
+  }
+
+  private dispatchTools(origin: OriginTurn): void {
+    if (!origin.waiter || origin.dispatchScheduled) return;
+    const ready = Array.from(this.pendingToolRoutes.values()).filter((route) => route.threadId === origin.threadId
+      && route.turnId === origin.turnId && !route.delivered);
+    if (!ready.length) return;
+    origin.dispatchScheduled = true;
+    // Coalesce callbacks already queued in this event-loop tick. Later calls
+    // stay queued on the same origin and are exposed on the next response.
+    setTimeout(() => {
+      origin.dispatchScheduled = false;
+      if (!origin.waiter || this.origins.get(origin.threadId) !== origin) return;
+      let delivered = false;
+      for (const route of this.pendingToolRoutes.values()) {
+        if (route.threadId === origin.threadId && route.turnId === origin.turnId && !route.delivered) {
+          route.delivered = true;
+          origin.notifications.push(route.notification);
+          delivered = true;
+        }
+      }
+      if (delivered) this.flush(origin);
+    }, 0);
+  }
+
+  private forget(origin: OriginTurn): void {
+    this.origins.delete(origin.threadId);
+    this.starting.delete(origin.requestId);
+    if (origin.turnId) this.activeByTurn.delete(this.turnKey(origin.threadId, origin.turnId));
+    for (const [id, route] of this.pendingToolRoutes) {
+      if (route.threadId === origin.threadId && route.turnId === origin.turnId) this.pendingToolRoutes.delete(id);
+    }
+  }
+
+  private async cancelOrigin(origin: OriginTurn, message: string): Promise<void> {
+    if (this.origins.get(origin.threadId) !== origin) return;
+    const callbacks = Array.from(this.pendingToolRoutes.values()).filter((route) => route.threadId === origin.threadId && route.turnId === origin.turnId);
+    this.forget(origin);
+    origin.notifications = [{ method: "error", params: { message } }];
+    this.flush(origin);
+    if (origin.turnId) await this.writeJson(cancellationRequest(origin.threadId, origin.turnId, crypto.randomUUID())).catch(() => undefined);
+    for (const route of callbacks) await this.writeJson({ jsonrpc: "2.0", id: route.rpcId,
+      result: { success: false, contentItems: [{ type: "inputText", text: message }] } }).catch(() => undefined);
+    this.traceRoute("cancelled", origin);
+  }
+
+  private traceRoute(event: string, origin: OriginTurn, extra: Record<string, unknown> = {}): void {
+    if (process.env.CODEX_GATEWAY_TRACE_REQUESTS !== "1") return;
+    console.error(JSON.stringify({ event: `codex-gateway.${event}`, sessionId: origin.sessionId,
+      threadId: origin.threadId, turnId: origin.turnId, requestId: origin.requestId, ...extra }));
+  }
+
+  async models(): Promise<CodexModelListResult> { await this.initialize(); return await this.request(crypto.randomUUID(), "model/list", {}) as CodexModelListResult; }
+  async account(): Promise<unknown> { await this.initialize(); return await this.request(crypto.randomUUID(), "account/read", { refreshToken: false }); }
+  async accountRateLimits(): Promise<unknown> { await this.initialize(); return await this.request(crypto.randomUUID(), "account/rateLimits/read", { excludeResetCreditDetails: false }); }
+  async accountUsage(threadId?: string | null): Promise<unknown> { await this.initialize(); return await this.request(crypto.randomUUID(), "account/usage/read", threadId ? { threadId } : {}); }
+  async interruptAll(): Promise<void> { for (const origin of Array.from(this.origins.values())) await this.cancelOrigin(origin, "Codex gateway stopped."); }
+
   private async initialize(): Promise<void> {
-    if (this.initialized) return;
-    this.initialized = true;
-    await this.request("initialize", "initialize", {
-      capabilities: {
-        experimentalApi: true,
-        requestAttestation: false,
-      },
-      clientInfo: { name: "fk-toolkit-codex-gateway", title: "FK Toolkit Codex Gateway", version: "0.6.1" },
-    });
-    await this.writeJson({
-      jsonrpc: "2.0",
-      method: "initialized",
-    });
+    if (this.closedError) throw this.closedError;
+    this.initialization ??= (async () => {
+      await this.request(crypto.randomUUID(), "initialize", { capabilities: { experimentalApi: true, requestAttestation: false },
+        clientInfo: { name: "fk-toolkit-codex-gateway", title: "FK Toolkit Codex Gateway", version: "0.6.1" } });
+      await this.writeJson({ jsonrpc: "2.0", method: "initialized" });
+    })();
+    await this.initialization;
   }
 
   private async request(id: string | number, method: string, params: Record<string, unknown> | undefined): Promise<unknown> {
     return await new Promise<unknown>((resolve, reject) => {
       this.rpcPending.set(id, { resolve, reject });
-      this.writeJson({ jsonrpc: "2.0", id, method, params }).catch((error) => {
-        this.rpcPending.delete(id);
-        reject(error instanceof Error ? error : new Error(String(error)));
-      });
+      this.writeJson({ jsonrpc: "2.0", id, method, params }).catch((error) => { this.rpcPending.delete(id); reject(error); });
     });
   }
 
   private rejectAll(error: unknown): void {
     const err = error instanceof Error ? error : new Error(String(error));
-    for (const pending of this.pending.values()) pending.reject(err);
-    this.pending.clear();
-    this.activeByTurn.clear();
-    this.pendingToolRoutes.clear();
+    this.closedError = err;
+    for (const rpc of this.rpcPending.values()) rpc.reject(err);
+    this.rpcPending.clear();
+    for (const origin of Array.from(this.origins.values())) {
+      origin.waiter?.reject(err);
+      this.forget(origin);
+    }
   }
 
-  private async writeJson(value: unknown): Promise<void> {
-    await this.proc.stdin.write(encoder.encode(`${JSON.stringify(value)}\n`));
-  }
+  private async writeJson(value: unknown): Promise<void> { await this.proc.stdin.write(encoder.encode(`${JSON.stringify(value)}\n`)); }
 
   private async readLoop(): Promise<void> {
     if (!this.proc.stdout) throw new Error("Codex app-server stdout is unavailable");
@@ -1600,13 +1610,12 @@ export class CodexJsonRpcClient {
     let buffer = "";
     for (;;) {
       const { value, done } = await reader.read();
-      if (done) break;
+      if (done) throw new Error("Codex app-server closed its output.");
       buffer += decoder.decode(value, { stream: true });
       let nl = buffer.indexOf("\n");
       while (nl >= 0) {
-        const line = buffer.slice(0, nl).trim();
-        buffer = buffer.slice(nl + 1);
-        if (line) this.handleMessage(JSON.parse(line) as JsonRpcNotification | JsonRpcRequest);
+        const line = buffer.slice(0, nl).trim(); buffer = buffer.slice(nl + 1);
+        if (line) this.handleMessage(JSON.parse(line));
         nl = buffer.indexOf("\n");
       }
     }
@@ -1615,98 +1624,77 @@ export class CodexJsonRpcClient {
   private async stderrLoop(): Promise<void> {
     if (!this.proc.stderr) return;
     const reader = this.proc.stderr.getReader();
-    for (;;) {
-      const { value, done } = await reader.read();
-      if (done) break;
-      const text = decoder.decode(value);
-      if (text.trim()) console.error(text.trimEnd());
-    }
+    for (;;) { const { value, done } = await reader.read(); if (done) break; const text = decoder.decode(value); if (text.trim()) console.error(text.trimEnd()); }
   }
 
-  private respondToClientRequest(id: string | number, method: string): boolean {
-    const result = failClosedClientRequestResult(method);
-    if (!result) return false;
-    void this.writeJson({ jsonrpc: "2.0", id, result });
+  private bindTurn(origin: OriginTurn, turnId: string): boolean {
+    if (origin.turnId && origin.turnId !== turnId) return false;
+    origin.turnId = turnId;
+    origin.state.appServerThreadId = origin.threadId;
+    origin.state.appServerTurnId = turnId;
+    this.activeByTurn.set(this.turnKey(origin.threadId, turnId), origin);
     return true;
   }
 
-  private handleMessage(message: JsonRpcNotification | JsonRpcRequest): void {
-    const record = message as Record<string, unknown>;
-    if ("id" in record && "method" in record) {
-      if (record["method"] === "item/tool/call") {
-        this.recordNotification(message as JsonRpcNotification);
-        void this.writeJson({
-          jsonrpc: "2.0",
-          id: record["id"] as string | number,
-          result: { success: true, contentItems: [] },
-        });
-        return;
-      }
-      const handled = this.respondToClientRequest(record["id"] as string | number, String(record["method"]));
-      if (handled) return;
-    }
-    if ("id" in record && !("method" in record)) {
-      const id = record["id"] as string | number;
-      const rpc = this.rpcPending.get(id);
-      if (rpc) {
-        this.rpcPending.delete(id);
-        if ("error" in record) rpc.reject(new Error(JSON.stringify(record["error"])));
-        else rpc.resolve(record["result"]);
-        return;
-      }
-      const pending = this.pending.get(id);
-      if (pending && "error" in record) {
-        pending.reject(new Error(JSON.stringify(record["error"])));
-        this.pending.delete(id);
+  private handleMessage(record: Record<string, any>): void {
+    if ("id" in record && !record.method) {
+      const rpc = this.rpcPending.get(record.id);
+      if (rpc) { this.rpcPending.delete(record.id); if (record.error) rpc.reject(new Error(JSON.stringify(record.error))); else rpc.resolve(record.result); return; }
+      const origin = this.starting.get(record.id);
+      if (origin) {
+        this.starting.delete(record.id);
+        if (record.error) { void this.cancelOrigin(origin, JSON.stringify(record.error)); return; }
+        if (record.result?.turn?.id && !this.bindTurn(origin, record.result.turn.id)) void this.cancelOrigin(origin, "Codex turn/start returned an inconsistent turn id.");
       }
       return;
     }
-    this.recordNotification(message as JsonRpcNotification);
-  }
-
-  private recordNotification(notification: JsonRpcNotification): void {
-    const params = notification.params ?? {};
+    if (record.method === "serverRequest/resolved") {
+      for (const [id, route] of this.pendingToolRoutes) {
+        if (route.threadId === record.params?.threadId && route.rpcId === record.params?.requestId) {
+          this.pendingToolRoutes.delete(id);
+        }
+      }
+      return;
+    }
+    if (record.method === "item/tool/call") {
+      const params = record.params ?? {};
+      const origin = this.activeByTurn.get(this.turnKey(params.threadId, params.turnId));
+      const previous = origin?.seenToolCalls.get(params.callId);
+      if (previous !== undefined && previous === record.id) return;
+      if (!origin || previous !== undefined || !params.callId || !("id" in record)) {
+        if ("id" in record) void this.writeJson({ jsonrpc: "2.0", id: record.id, result: failClosedClientRequestResult(record.method) });
+        return;
+      }
+      const translated = dynamicToolUseFromToolCallParams(params, origin.state.toolNameAliases);
+      const invalid = !translated || missingRequiredToolUseArguments(translated, origin.state.toolRequiredArguments);
+      if (invalid) { void this.writeJson({ jsonrpc: "2.0", id: record.id, result: failClosedClientRequestResult(record.method) }); void this.cancelOrigin(origin, typeof invalid === "string" ? invalid : "Malformed dynamic tool request."); return; }
+      origin.seenToolCalls.set(params.callId, record.id);
+      this.pendingToolRoutes.set(params.callId, { threadId: params.threadId, turnId: params.turnId,
+        sessionId: origin.sessionId, rpcId: record.id, delivered: false, notification: { method: record.method, params } });
+      this.traceRoute("tool_call", origin, { toolUseId: params.callId, rpcId: record.id, toolName: translated.name });
+      this.dispatchTools(origin);
+      return;
+    }
+    if ("id" in record && record.method) {
+      const result = failClosedClientRequestResult(record.method);
+      if (result) { void this.writeJson({ jsonrpc: "2.0", id: record.id, result }); return; }
+    }
+    const params = record.params ?? {};
+    const threadId = readString(params, "threadId");
     const turnId = readTurnId(params);
-    let pending = turnId ? this.activeByTurn.get(turnId)?.pending : undefined;
-    if (!pending && notification.method === "turn/started") {
-      const latest = Array.from(this.pending.values()).at(-1);
-      const startedTurn = readTurnId(params);
-      if (latest && startedTurn) {
-        pending = latest;
-        const threadId = readString(params, "threadId") ?? "";
-        this.activeByTurn.set(startedTurn, { threadId, pending: latest });
-      }
-    }
-    if (!pending && turnId && this.activeByTurn.has(turnId)) return;
-    if (!pending) pending = Array.from(this.pending.values()).at(-1);
-    if (!pending) return;
-    pending.notifications.push(notification);
-    if (notification.method === "item/tool/call") {
-      const callId = readString(params, "callId");
-      const threadId = readString(params, "threadId");
-      if (callId && turnId && threadId) {
-        this.pendingToolRoutes.set(callId, { threadId, turnId });
-      }
-      try {
-        pending.resolve(toAnthropicStreamEvents(pending.notifications, pending.state));
-      } catch (error) {
-        pending.reject(error instanceof Error ? error : new Error(String(error)));
-      }
-      for (const [id, p] of this.pending.entries()) {
-        if (p === pending) this.pending.delete(id);
-      }
-      return;
-    }
-    if (notification.method === "turn/completed" || notification.method === "turn/failed" || notification.method === "turn/interrupted" || notification.method === "error") {
-      try {
-        pending.resolve(toAnthropicStreamEvents(pending.notifications, pending.state));
-      } catch (error) {
-        pending.reject(error instanceof Error ? error : new Error(String(error)));
-      }
-      for (const [id, p] of this.pending.entries()) {
-        if (p === pending) this.pending.delete(id);
-      }
-      if (turnId) this.activeByTurn.delete(turnId);
+    const starting = threadId ? this.origins.get(threadId) : undefined;
+    if (record.method === "turn/started" && starting && turnId && !starting.turnId) this.bindTurn(starting, turnId);
+    const origin = threadId && turnId ? this.activeByTurn.get(this.turnKey(threadId, turnId)) : undefined;
+    if (!origin) return;
+    const terminal = ["turn/completed", "turn/failed", "turn/interrupted", "error"].includes(record.method);
+    // Completed dynamic-tool items confirm execution; they must not become a
+    // second Claude tool_use after the outstanding callback was answered.
+    if (record.method === "item/completed" && params.item?.type === "dynamicToolCall") return;
+    origin.notifications.push({ method: record.method, params });
+    if (terminal) {
+      this.traceRoute("terminal", origin, { status: params.turn?.status ?? record.method });
+      this.forget(origin);
+      this.flush(origin);
     }
   }
 }
@@ -1799,16 +1787,7 @@ async function serve(): Promise<void> {
         return Response.json({ type: "error", error: { type: "invalid_request_error", message: "invalid JSON" } }, { status: 400 });
       }
       try {
-        const events = await client.turn(body, cwd, claudeGatewayHeaderHints(req.headers));
-        if (shouldStreamAnthropicResponse(body)) {
-          return new Response(events.map(sseEncode).join(""), {
-            headers: {
-              "content-type": "text/event-stream; charset=utf-8",
-              "cache-control": "no-cache",
-              connection: "keep-alive",
-            },
-          });
-        }
+        const events = await client.turn(body, cwd, claudeGatewayHeaderHints(req.headers), req.signal);
         const eventError = events.find((event) => event.event === "error");
         if (eventError) {
           return Response.json({
@@ -1818,6 +1797,15 @@ async function serve(): Promise<void> {
               message: errorMessageFromEvent(eventError),
             },
           }, { status: 400 });
+        }
+        if (shouldStreamAnthropicResponse(body)) {
+          return new Response(events.map(sseEncode).join(""), {
+            headers: {
+              "content-type": "text/event-stream; charset=utf-8",
+              "cache-control": "no-cache",
+              connection: "keep-alive",
+            },
+          });
         }
         return Response.json(nonStreamingAnthropicResponseFromEvents(
           body,
