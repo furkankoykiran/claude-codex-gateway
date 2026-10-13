@@ -1,5 +1,5 @@
 import { version } from "../package.json";
-import { type AnthropicToolResultBlock, type AnthropicMessagesRequest, type JsonRpcNotification, type AnthropicSseEvent, type GatewayState, type PendingToolRoute, type ClaudeGatewayHeaderHints, type CodexModelListResult, createGatewayState, toCodexRequests, codexThreadStartParams, latestUserMessage, latestUserContentBlockTypes, turnTextForRequest, traceClaudeGatewayRequest, resolveCodexModel, toAnthropicStreamEvents, cancellationRequest, validateAnthropicRequest, flattenContent, readString, readTurnId, missingRequiredToolUseArguments, dynamicToolUseFromToolCallParams } from "./protocol.ts";
+import { type AnthropicToolResultBlock, type AnthropicMessagesRequest, type JsonRpcNotification, type AnthropicSseEvent, type GatewayState, type PendingToolRoute, type ClaudeGatewayHeaderHints, type CodexModelListResult, createGatewayState, toCodexRequests, codexThreadStartParams, extractSessionWorkingDirectory, latestUserMessage, latestUserContentBlockTypes, turnTextForRequest, traceClaudeGatewayRequest, resolveCodexModel, toAnthropicStreamEvents, cancellationRequest, validateAnthropicRequest, flattenContent, readString, readTurnId, missingRequiredToolUseArguments, dynamicToolUseFromToolCallParams } from "./protocol.ts";
 export type CodexProcess = {
   stdin: { write(chunk: Uint8Array): unknown | Promise<unknown> };
   stdout: ReadableStream<Uint8Array> | null;
@@ -143,8 +143,9 @@ export class CodexJsonRpcClient {
       await this.initialize();
       const selectedModel = process.env.CODEX_GATEWAY_MODEL || process.env.CODEX_MODEL;
       state.model = resolveCodexModel(request.model, selectedModel);
+      const effectiveCwd = extractSessionWorkingDirectory(request.messages, request.system) || cwd;
       const response = await this.request(crypto.randomUUID(), "thread/start", codexThreadStartParams(
-        cwd, selectedModel, request.model, request.tools ?? [], request.messages,
+        effectiveCwd, selectedModel, request.model, request.tools ?? [], request.messages,
         state.toolNameAliases, new Map(), state.toolRequiredArguments, state.turnText,
       ));
       const threadId = (response as { thread?: { id?: string } }).thread?.id;
@@ -157,7 +158,7 @@ export class CodexJsonRpcClient {
       const boundedOrigin = origin;
       origin.deadline = setTimeout(() => { void this.cancelOrigin(boundedOrigin, "Codex turn timed out."); }, this.timeoutMs);
       origin.deadline.unref();
-      const batch = toCodexRequests(request, { cwd, model: selectedModel, threadId, requestId,
+      const batch = toCodexRequests(request, { cwd: effectiveCwd, model: selectedModel, threadId, requestId,
         reasoningEffort: process.env.CODEX_GATEWAY_REASONING_EFFORT });
       events = await this.waitForResponse(origin, signal, () => this.writeJson(batch.requests[0]));
     }

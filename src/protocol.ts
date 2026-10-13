@@ -7,6 +7,9 @@
  * process-scoped network test blocks and observes Anthropic destinations.
  */
 
+import fs from "node:fs";
+import path from "node:path";
+
 export type AnthropicRole = "user" | "assistant" | "system";
 
 export type AnthropicTextBlock = {
@@ -250,6 +253,11 @@ export function toCodexRequests(
       }
     }
   }
+  const hasFileTools = request.tools?.some((t) => t.name === "Write" || t.name === "Edit");
+  if (hasFileTools) {
+    const clientToolNotice = "Client tools (including Write and Edit) are executed by Claude Code on the host filesystem with user approval. Invoke Write and Edit to create and modify files when requested.";
+    system = system ? `${system}\n\n${clientToolNotice}` : clientToolNotice;
+  }
   const additionalContext = system
     ? {
         "anthropic-system": {
@@ -259,9 +267,11 @@ export function toCodexRequests(
       }
     : null;
 
+  const effectiveCwd = extractSessionWorkingDirectory(request.messages, request.system) || options.cwd;
+
   const params: Record<string, unknown> = {
     input,
-    cwd: options.cwd,
+    cwd: effectiveCwd,
     model: resolveCodexModel(request.model, options.model),
     additionalContext,
     approvalPolicy: "never",
@@ -360,6 +370,12 @@ export function codexDynamicToolsForTurn(tools: AnthropicTool[], messages: Anthr
   }
   const mentioned = tools.filter((tool) => turnText.includes(tool.name.toLowerCase()));
   if (mentioned.length > 0) {
+    if (mentioned.some((tool) => tool.name === "Edit") && !mentioned.some((tool) => tool.name === "Read")) {
+      const readTool = tools.find((tool) => tool.name === "Read");
+      if (readTool) {
+        mentioned.push(readTool);
+      }
+    }
     return mentioned;
   }
   return tools;
@@ -423,6 +439,81 @@ export function isActionableUserText(text: string): boolean {
     && !trimmed.startsWith('{"type":"tool_result"');
 }
 
+const ENV_REMINDER_BLOCK_REGEX = /<system-reminder>[\s\S]*?# Environment[\s\S]*?-\s*Primary working directory:\s*([^\r\n]+)[\s\S]*?<\/system-reminder>/;
+const SYSTEM_ENV_REGEX = /(?:<system-reminder>[\s\S]*?)?# Environment[\s\S]*?-\s*Primary working directory:\s*([^\r\n]+)/;
+
+export function isExistingDirectory(targetPath: string): boolean {
+  try {
+    return fs.statSync(targetPath).isDirectory();
+  } catch {
+    return false;
+  }
+}
+
+export function sanitizeWorkingDirectory(
+  candidate: string | undefined | null,
+  validator: (dir: string) => boolean = isExistingDirectory,
+): string | null {
+  if (!candidate) return null;
+  const trimmed = candidate.trim().replace(/^['"]|['"]$/g, "");
+  if (!trimmed || trimmed.includes("\0")) return null;
+  if (!path.isAbsolute(trimmed)) return null;
+  const normalized = path.normalize(trimmed);
+  return validator(normalized) ? normalized : null;
+}
+
+export function extractSessionWorkingDirectory(
+  messages: AnthropicMessage[],
+  system?: string | AnthropicTextBlock[],
+  validator: (dir: string) => boolean = isExistingDirectory,
+): string | null {
+  for (const message of messages) {
+    if (Array.isArray(message.content)) {
+      for (const block of message.content) {
+        if (block.type === "text") {
+          const text = block.text.trimStart();
+          if (text.startsWith("<system-reminder>")) {
+            const match = text.match(ENV_REMINDER_BLOCK_REGEX);
+            if (match && match[1]) {
+              const sanitized = sanitizeWorkingDirectory(match[1], validator);
+              if (sanitized) return sanitized;
+            }
+          }
+        }
+      }
+    } else if (typeof message.content === "string") {
+      const text = message.content.trimStart();
+      if (text.startsWith("<system-reminder>")) {
+        const match = text.match(ENV_REMINDER_BLOCK_REGEX);
+        if (match && match[1]) {
+          const sanitized = sanitizeWorkingDirectory(match[1], validator);
+          if (sanitized) return sanitized;
+        }
+      }
+    }
+  }
+
+  if (typeof system === "string") {
+    const match = system.match(SYSTEM_ENV_REGEX);
+    if (match && match[1]) {
+      const sanitized = sanitizeWorkingDirectory(match[1], validator);
+      if (sanitized) return sanitized;
+    }
+  } else if (Array.isArray(system)) {
+    for (const block of system) {
+      if (block.type === "text") {
+        const match = block.text.match(SYSTEM_ENV_REGEX);
+        if (match && match[1]) {
+          const sanitized = sanitizeWorkingDirectory(match[1], validator);
+          if (sanitized) return sanitized;
+        }
+      }
+    }
+  }
+
+  return null;
+}
+
 export function codexDynamicToolInputSchema(toolName: string, inputSchema: unknown): unknown {
   if (!inputSchema || typeof inputSchema !== "object" || Array.isArray(inputSchema)) {
     return {
@@ -459,7 +550,11 @@ export function requiredArgumentsFromSchema(inputSchema: unknown): string[] {
 }
 
 export function codexDynamicToolDescription(tool: AnthropicTool, inputSchema: unknown): string {
-  const base = tool.description?.trim() ?? "";
+  let base = tool.description?.trim() ?? "";
+  if (tool.name === "Write" || tool.name === "Edit" || tool.name === "NotebookEdit") {
+    const hostNotice = "Claude Code client tool executed on the host filesystem outside the sandbox. Invoke this tool when requested to create or edit files; the read-only sandbox does not prevent calling this tool.";
+    base = base ? `${hostNotice}\n\n${base}` : hostNotice;
+  }
   const schema = JSON.stringify(inputSchema);
   const contract = `Call this Claude Code client tool with JSON arguments matching this schema: ${schema}`;
   return base ? `${base}\n\n${contract}` : contract;
